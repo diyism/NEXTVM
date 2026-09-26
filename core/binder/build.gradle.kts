@@ -21,6 +21,7 @@ dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:hook"))
     implementation(project(":core:sandbox"))
+    implementation(project(":core:services"))
 
     implementation(libs.core.ktx)
     implementation(libs.timber)

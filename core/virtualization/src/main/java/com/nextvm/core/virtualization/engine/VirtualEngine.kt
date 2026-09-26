@@ -234,7 +234,7 @@ class VirtualEngine @Inject constructor(
             // Step 5.5: Install IActivityManager + IPackageManager Binder proxies
             // These intercept critical IPC calls (startActivity, getContentProvider, etc.)
             // and fix callingPackage to match the host UID, preventing SecurityException.
-            binderProxyManager = BinderProxyManager(context)
+            binderProxyManager = BinderProxyManager(context, serviceManager.packageManager)
             binderProxyManager.installAllProxies()
             Timber.tag(TAG).d("Binder proxies installed (IActivityManager + IPackageManager)")
 

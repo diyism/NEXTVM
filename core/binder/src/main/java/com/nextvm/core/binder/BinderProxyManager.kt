@@ -7,6 +7,7 @@ import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
 import com.nextvm.core.model.GmsServiceRouter
 import com.nextvm.core.model.VirtualApp
+import com.nextvm.core.services.pm.VirtualPackageManagerService
 import timber.log.Timber
 import java.lang.reflect.Proxy
 
@@ -20,7 +21,10 @@ import java.lang.reflect.Proxy
  * These proxies intercept system service calls from guest apps and
  * redirect them through our virtual engine instead of the real system.
  */
-class BinderProxyManager(private val context: Context) {
+class BinderProxyManager(
+    private val context: Context,
+    private val virtualPm: VirtualPackageManagerService
+) {
 
     companion object {
         private const val TAG = "BinderProxy"
@@ -170,7 +174,12 @@ class BinderProxyManager(private val context: Context) {
                 ?: throw IllegalStateException("sPackageManager is null")
 
             // Create our proxy handler
-            pmProxy = PackageManagerProxy(originalPm, context)
+            pmProxy = PackageManagerProxy(
+                original = originalPm,
+                context = context,
+                virtualPm = virtualPm,
+                callerResolver = VirtualCallerResolver(context, virtualPm)
+            )
 
             // Create dynamic proxy
             val ipmClass = Class.forName("android.content.pm.IPackageManager")

@@ -1,13 +1,18 @@
 package com.nextvm.core.binder.proxy
 
 import android.content.Context
+import android.content.ComponentName
+import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
+import android.content.pm.ResolveInfo
+import com.nextvm.core.binder.VirtualCallerResolver
 import com.nextvm.core.model.GmsServiceRouter
 import com.nextvm.core.model.VirtualApp
 import com.nextvm.core.model.VirtualConstants
+import com.nextvm.core.services.pm.VirtualPackageManagerService
 import timber.log.Timber
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
@@ -25,7 +30,9 @@ import java.lang.reflect.Method
  */
 class PackageManagerProxy(
     private val original: Any,
-    private val context: Context
+    private val context: Context,
+    private val virtualPm: VirtualPackageManagerService,
+    private val callerResolver: VirtualCallerResolver
 ) : InvocationHandler {
 
     companion object {
@@ -58,14 +65,14 @@ class PackageManagerProxy(
     }
 
     fun registerApp(app: VirtualApp) {
-        virtualApps[app.packageName] = app
-        // Pre-build PackageInfo for this app using direct APK parsing
-        parseApkDirect(app)
+        // Package data is registered by VirtualEngine in VirtualPackageManagerService.
+        // Keep this callback for BinderProxyManager compatibility, but do not
+        // maintain a second PackageInfo registry here.
+        Timber.tag(TAG).d("Binder registration observed for ${app.packageName}")
     }
 
     fun unregisterApp(packageName: String) {
-        virtualApps.remove(packageName)
-        packageInfoCache.remove(packageName)
+        Timber.tag(TAG).d("Binder unregistration observed for $packageName")
     }
 
     /**
@@ -73,7 +80,10 @@ class PackageManagerProxy(
      * Returns activity-specific theme if set, falls back to application theme.
      */
     fun getActivityTheme(packageName: String, activityName: String): Int {
-        val pkgInfo = packageInfoCache[packageName] ?: return 0
+        val pkgInfo = virtualPm.getPackageInfo(
+            packageName,
+            PackageManager.GET_ACTIVITIES or PackageManager.GET_META_DATA
+        ) ?: return 0
         val ai = pkgInfo.activities?.firstOrNull { it.name == activityName }
         if (ai != null && ai.theme != 0) return ai.theme
         return pkgInfo.applicationInfo?.theme ?: 0
@@ -90,6 +100,7 @@ class PackageManagerProxy(
                 "resolveIntent" -> handleResolveIntent(method, args)
                 "queryIntentActivities" -> handleQueryIntentActivities(method, args)
                 "getInstalledPackages" -> handleGetInstalledPackages(method, args)
+                "getInstalledApplications" -> handleGetInstalledApplications(method, args)
                 "getPackageUid" -> handleGetPackageUid(method, args)
                 "checkPermission" -> handleCheckPermission(method, args)
                 "checkUidPermission" -> handleCheckUidPermission(method, args)
@@ -124,6 +135,18 @@ class PackageManagerProxy(
             if (cause is SecurityException) {
                 Timber.tag(TAG).w("PM SecurityException swallowed for $methodName: ${cause.message}")
                 null
+            } else if (callerResolver.isGuestProcess() && isGuestIsolatedMethod(methodName)) {
+                // Never recover an isolation failure by forwarding the same
+                // request to the real PMS; that would leak the main-profile
+                // package list after a proxy-side error.
+                if (methodName == "getInstalledPackages" ||
+                    methodName == "getInstalledApplications" ||
+                    methodName == "queryIntentActivities"
+                ) {
+                    wrapListReturnValue(method.returnType, emptyList<Any>())
+                } else {
+                    null
+                }
             } else {
                 invokeOriginal(method, args)
             }
@@ -134,13 +157,30 @@ class PackageManagerProxy(
         if (args == null || args.isEmpty()) return invokeOriginal(method, args)
 
         val packageName = args[0] as? String
+        val flags = extractFlags(args, 1)
 
-        // Check virtual apps first
-        if (packageName != null && virtualApps.containsKey(packageName)) {
-            val cached = packageInfoCache[packageName]
-            if (cached != null) {
-                Timber.tag(TAG).d("Returning virtual PackageInfo for $packageName")
-                return cached
+        // The virtual service is the source of truth for Guest package data.
+        if (packageName != null && virtualPm.isVirtualPackage(packageName)) {
+            val info = virtualPm.getPackageInfo(packageName, flags)
+            Timber.tag(TAG).d("Returning virtual PackageInfo for $packageName")
+            return info
+        }
+
+        // Do not expose arbitrary main-profile packages to Guest code. System
+        // packages are still allowed because Android libraries commonly query
+        // them directly, while user-installed host packages remain hidden.
+        if (callerResolver.isGuestProcess() && packageName != null) {
+            if (isGmsPackage(packageName)) {
+                return getGmsPackageInfo(method, args, packageName)
+            }
+            val realInfo = invokeOriginal(method, args) as? PackageInfo
+            return if (realInfo?.applicationInfo?.flags?.and(ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                packageName == context.packageName
+            ) {
+                realInfo
+            } else {
+                Timber.tag(TAG).d("Hiding host PackageInfo from Guest: $packageName")
+                null
             }
         }
 
@@ -176,9 +216,9 @@ class PackageManagerProxy(
         if (args == null || args.isEmpty()) return invokeOriginal(method, args)
 
         val packageName = args[0] as? String
-        if (packageName != null && virtualApps.containsKey(packageName)) {
-            val app = virtualApps[packageName]!!
-            val appInfo = buildApplicationInfo(app)
+        val flags = extractFlags(args, 1)
+        if (packageName != null && virtualPm.isVirtualPackage(packageName)) {
+            val appInfo = virtualPm.getApplicationInfo(packageName, flags)
             Timber.tag(TAG).d("Returning virtual ApplicationInfo for $packageName")
             return appInfo
         }
@@ -193,11 +233,25 @@ class PackageManagerProxy(
             }
         }
 
+        if (callerResolver.isGuestProcess() && packageName != null) {
+            val realInfo = invokeOriginal(method, args) as? ApplicationInfo
+            return if (realInfo?.flags?.and(ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                packageName == context.packageName
+            ) {
+                realInfo
+            } else {
+                Timber.tag(TAG).d("Hiding host ApplicationInfo from Guest: $packageName")
+                null
+            }
+        }
+
         // Host package — inject GMS version metadata so Google Play Services SDKs
         // inside virtual apps don't throw GooglePlayServicesMissingManifestValueException.
         // Many SDKs call context.getPackageName() which returns the host package name,
         // then check getApplicationInfo(hostPkg).metaData for com.google.android.gms.version.
-        if (packageName != null && virtualApps.isNotEmpty() && packageName == context.packageName) {
+        if (packageName != null && virtualPm.getAllPackageNames().isNotEmpty() &&
+            packageName == context.packageName
+        ) {
             val result = invokeOriginal(method, args) as? ApplicationInfo
             if (result != null) {
                 val meta = result.metaData ?: android.os.Bundle()
@@ -214,32 +268,142 @@ class PackageManagerProxy(
     }
 
     private fun handleGetActivityInfo(method: Method, args: Array<out Any>?): Any? {
-        // TODO: Return virtual ActivityInfo for virtual app activities
+        val component = args?.firstOrNull { it is ComponentName } as? ComponentName
+        if (component != null && virtualPm.isVirtualPackage(component.packageName)) {
+            return virtualPm.getActivityInfo(component, extractFlags(args, 1))
+        }
+        if (callerResolver.isGuestProcess() && component != null &&
+            !isSystemPackage(component.packageName) && component.packageName != context.packageName
+        ) {
+            return null
+        }
         return invokeOriginal(method, args)
     }
 
     private fun handleResolveIntent(method: Method, args: Array<out Any>?): Any? {
-        // TODO: Resolve against virtual component registry
+        val intent = args?.firstOrNull { it is Intent } as? Intent
+        if (callerResolver.isGuestProcess()) {
+            return intent?.let { virtualPm.resolveActivity(it) }
+        }
         return invokeOriginal(method, args)
     }
 
     private fun handleQueryIntentActivities(method: Method, args: Array<out Any>?): Any? {
-        // TODO: Include virtual app activities in results
+        val intent = args?.firstOrNull { it is Intent } as? Intent
+        if (callerResolver.isGuestProcess()) {
+            val results = intent?.let { virtualPm.queryIntentActivities(it) } ?: emptyList()
+            Timber.tag(TAG).d(
+                "Guest queryIntentActivities(${intent?.action}, ${intent?.component}) -> " +
+                    results.mapNotNull { it.activityInfo?.packageName }
+            )
+            return wrapListReturnValue(method.returnType, results)
+        }
         return invokeOriginal(method, args)
     }
 
     private fun handleGetInstalledPackages(method: Method, args: Array<out Any>?): Any? {
-        // Return real packages + virtual packages
+        if (callerResolver.isGuestProcess()) {
+            val packages = virtualPm.getInstalledPackages(extractFlags(args))
+            Timber.tag(TAG).d(
+                "Guest getInstalledPackages -> ${packages.mapNotNull { it.packageName }}"
+            )
+            return wrapListReturnValue(method.returnType, packages)
+        }
         return invokeOriginal(method, args)
+    }
+
+    private fun handleGetInstalledApplications(method: Method, args: Array<out Any>?): Any? {
+        if (callerResolver.isGuestProcess()) {
+            val applications = virtualPm.getInstalledApplications(extractFlags(args))
+            Timber.tag(TAG).d(
+                "Guest getInstalledApplications -> ${applications.map { it.packageName }}"
+            )
+            return wrapListReturnValue(method.returnType, applications)
+        }
+        return invokeOriginal(method, args)
+    }
+
+    private fun isGmsPackage(packageName: String): Boolean {
+        return gmsRouter?.isGmsPackage(packageName) == true
+    }
+
+    private fun getGmsPackageInfo(
+        method: Method,
+        args: Array<out Any>,
+        packageName: String
+    ): Any? {
+        val router = gmsRouter ?: return null
+        if (gmsLookupInProgress.get() == true) return null
+
+        try {
+            val realInfo = invokeOriginal(method, args)
+            if (realInfo != null) return realInfo
+        } catch (_: Exception) {
+            // Fall through to the synthesized GMS record.
+        }
+
+        gmsLookupInProgress.set(true)
+        return try {
+            router.synthesizeGmsPackageInfo(packageName)?.also {
+                Timber.tag(TAG).d(
+                    "Returning synthesized GMS PackageInfo for $packageName (v=${it.versionName})"
+                )
+            }
+        } finally {
+            gmsLookupInProgress.set(false)
+        }
+    }
+
+    private fun isSystemPackage(packageName: String): Boolean {
+        return packageName == "android" || packageName.startsWith("android.") ||
+            packageName.startsWith("com.android.")
+    }
+
+    private fun isGuestIsolatedMethod(methodName: String): Boolean {
+        return methodName == "getPackageInfo" ||
+            methodName == "getApplicationInfo" ||
+            methodName == "getActivityInfo" ||
+            methodName == "resolveIntent" ||
+            methodName == "queryIntentActivities" ||
+            methodName == "getInstalledPackages" ||
+            methodName == "getInstalledApplications"
+    }
+
+    private fun extractFlags(args: Array<out Any>?, startIndex: Int = 0): Int {
+        if (args == null) return 0
+        return args.drop(startIndex)
+            .firstOrNull { it is Number }
+            ?.let { (it as Number).toLong().toInt() }
+            ?: 0
+    }
+
+    /**
+     * IPackageManager uses ParceledListSlice on current Android releases,
+     * while older releases and test doubles may expose a normal List.
+     */
+    private fun wrapListReturnValue(returnType: Class<*>, items: List<*>): Any {
+        if (returnType.isAssignableFrom(items.javaClass) ||
+            java.util.List::class.java.isAssignableFrom(returnType)
+        ) {
+            return items
+        }
+
+        if (returnType.name == "android.content.pm.ParceledListSlice") {
+            val constructor = returnType.getConstructor(java.util.List::class.java)
+            return constructor.newInstance(items)
+        }
+
+        throw IllegalStateException("Unsupported PackageManager list return type: $returnType")
     }
 
     private fun handleGetPackageUid(method: Method, args: Array<out Any>?): Any? {
         if (args == null || args.isEmpty()) return invokeOriginal(method, args)
 
         val packageName = args[0] as? String
-        if (packageName != null && virtualApps.containsKey(packageName)) {
+        val record = packageName?.let { virtualPm.getRecord(it) }
+        if (record != null) {
             // Return a virtual UID based on process slot
-            val app = virtualApps[packageName]!!
+            val app = record.virtualApp
             val virtualUid = 10000 + app.processSlot + 1000 // Offset to avoid conflicts
             return virtualUid
         }
@@ -253,8 +417,9 @@ class PackageManagerProxy(
         val permission = args[0] as? String
         val packageName = args[1] as? String
 
-        if (packageName != null && virtualApps.containsKey(packageName)) {
-            val app = virtualApps[packageName]!!
+        val record = packageName?.let { virtualPm.getRecord(it) }
+        if (record != null) {
+            val app = record.virtualApp
             // Check against virtual permission overrides (allow explicit deny)
             val override = app.permissionOverrides[permission]
             if (override != null) {
@@ -279,7 +444,7 @@ class PackageManagerProxy(
 
         // If any virtual app is registered, grant permissions for the host UID
         // because all virtual apps run under the host app's UID
-        if (virtualApps.isNotEmpty()) {
+        if (virtualPm.getAllPackageNames().isNotEmpty()) {
             val hostUid = android.os.Process.myUid()
             val checkedUid = args[1] as? Int
             if (checkedUid == hostUid) {

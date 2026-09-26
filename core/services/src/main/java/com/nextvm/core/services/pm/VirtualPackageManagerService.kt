@@ -103,6 +103,7 @@ class VirtualPackageManagerService @Inject constructor() {
             firstInstallTime = app.installedAt
             lastUpdateTime = app.installedAt
             requestedPermissions = app.requestedPermissions.toTypedArray()
+            applicationInfo = buildVirtualApplicationInfo(app)
         }
 
         val activities = app.activities.map { name ->
@@ -113,6 +114,29 @@ class VirtualPackageManagerService @Inject constructor() {
                 targetActivity = app.activityAliases[name]
             )
         }
+
+        val applicationInfo = buildVirtualApplicationInfo(app)
+        packageInfo.applicationInfo = applicationInfo
+        packageInfo.activities = activities.map { detail ->
+            ActivityInfo().apply {
+                name = detail.name
+                packageName = app.packageName
+                this.applicationInfo = applicationInfo
+            }
+        }.toTypedArray()
+        packageInfo.services = app.services.map { name ->
+            ServiceInfo().apply {
+                this.name = name
+                packageName = app.packageName
+            }
+        }.toTypedArray()
+        packageInfo.providers = app.providers.map { name ->
+            ProviderInfo().apply {
+                this.name = name
+                packageName = app.packageName
+            }
+        }.toTypedArray()
+        packageInfo.receivers = emptyArray()
 
         val record = VirtualPackageRecord(
             virtualApp = app,
@@ -201,13 +225,17 @@ class VirtualPackageManagerService @Inject constructor() {
      */
     fun getApplicationInfo(packageName: String, flags: Int = 0): ApplicationInfo? {
         val record = packages[packageName] ?: return null
-        val original = record.packageInfo.applicationInfo ?: return null
+        val original = record.packageInfo.applicationInfo
+            ?: buildVirtualApplicationInfo(record.virtualApp)
 
         return ApplicationInfo(original).apply {
+            this.packageName = record.virtualApp.packageName
             this.sourceDir = record.virtualApp.apkPath
             this.publicSourceDir = record.virtualApp.apkPath
             this.dataDir = record.virtualApp.dataDir
             this.nativeLibraryDir = record.virtualApp.libDir
+            this.enabled = true
+            this.flags = this.flags or ApplicationInfo.FLAG_INSTALLED or ApplicationInfo.FLAG_HAS_CODE
         }
     }
 
@@ -289,9 +317,27 @@ class VirtualPackageManagerService @Inject constructor() {
                 continue
             }
 
-            // For implicit intents from matching package
-            if (targetPkg == pkgName) {
-                record.packageInfo.activities?.forEach { ai ->
+            // Without a target package, only expose the virtual launchers for
+            // the common ACTION_MAIN/CATEGORY_LAUNCHER query. Full implicit
+            // intent matching will be added when parsed intent filters are
+            // persisted in ComponentDetail.
+            val isLauncherQuery = targetPkg == null &&
+                intent.action == Intent.ACTION_MAIN &&
+                intent.hasCategory(Intent.CATEGORY_LAUNCHER)
+
+            // For package-targeted implicit intents, return the recorded
+            // activities. For a global launcher query, return only the app's
+            // declared main activity.
+            if (targetPkg == pkgName || isLauncherQuery) {
+                val activities = if (isLauncherQuery) {
+                    val mainName = record.mainActivity
+                    record.packageInfo.activities?.filter { ai ->
+                        mainName == null || ai.name == mainName
+                    }
+                } else {
+                    record.packageInfo.activities?.toList()
+                }
+                activities?.forEach { ai ->
                     results.add(ResolveInfo().apply { activityInfo = ai })
                 }
             }
@@ -306,6 +352,15 @@ class VirtualPackageManagerService @Inject constructor() {
      */
     fun getInstalledPackages(flags: Int = 0): List<PackageInfo> {
         return packages.keys.mapNotNull { getPackageInfo(it, flags) }
+    }
+
+    /**
+     * Get all installed virtual applications. This is deliberately derived
+     * from the same registry as getInstalledPackages() so the two APIs cannot
+     * disagree after install, uninstall, or disk reload.
+     */
+    fun getInstalledApplications(flags: Int = 0): List<ApplicationInfo> {
+        return packages.keys.mapNotNull { getApplicationInfo(it, flags) }
     }
 
     // ---------- Permission Management ----------
@@ -380,5 +435,18 @@ class VirtualPackageManagerService @Inject constructor() {
      */
     fun initialize(context: android.content.Context) {
         Timber.tag(TAG).d("VirtualPackageManagerService initialized")
+    }
+
+    private fun buildVirtualApplicationInfo(app: VirtualApp): ApplicationInfo {
+        return ApplicationInfo().apply {
+            packageName = app.packageName
+            sourceDir = app.apkPath
+            publicSourceDir = app.apkPath
+            dataDir = app.dataDir
+            nativeLibraryDir = app.libDir
+            processName = app.packageName
+            enabled = true
+            flags = ApplicationInfo.FLAG_INSTALLED or ApplicationInfo.FLAG_HAS_CODE
+        }
     }
 }
