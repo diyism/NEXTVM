@@ -252,6 +252,19 @@ NEXTVM is currently in **alpha stage**. The core virtualization engine, sandbox 
 - Comprehensive test suite
 - Performance optimization and memory management
 
+### Known Limitations
+
+- **Strong commercial packers (e.g. SecNeo / 爱加密)**: apps protected by
+  these shells crash inside the guest shortly after the shell library
+  loads (verified with China Unicom v13.0). The shell's integrity check
+  still detects the virtual environment even though every
+  process-identity surface now reports the guest identity — kernel comm
+  and argv[0], `/proc` contents (maps / status / stat / cmdline),
+  fd and task enumeration, and the framework bind data behind
+  `ActivityThread.currentProcessName()`. Root-causing the remaining
+  detection channel (suspected: the synthetic ClassLoader / DexFile
+  object graph the shell's ART hooks inspect) is not currently planned.
+
 ---
 
 ## Contributing
