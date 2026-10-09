@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import com.nextvm.core.apk.VirtualClassLoader
 import com.nextvm.core.binder.BinderProxyManager
+import com.nextvm.core.binder.VirtualCallerResolver
 import com.nextvm.core.binder.proxy.ContentResolverProxy
 import com.nextvm.core.binder.proxy.SystemServiceProxyManager
 import com.nextvm.core.common.AndroidCompat
@@ -1185,6 +1186,26 @@ class VirtualEngine @Inject constructor(
      * 5. Call Application.attachBaseContext()
      * 6. Call Application.onCreate()
      */
+    /**
+     * Rewrite ActivityThread's bind-data process name to the guest's.
+     * The stub process was bound by AMS under com.nextvm.app:pN, and
+     * ActivityThread.currentProcessName() reads exactly this field —
+     * the last place the stub identity remains visible to guest code
+     * after the kernel-comm and argv0 renames.
+     */
+    private fun rewriteBoundProcessName(guestProcessName: String) {
+        val atClass = Class.forName("android.app.ActivityThread")
+        val activityThread = atClass.getMethod("currentActivityThread").invoke(null) ?: return
+        val boundField = atClass.getDeclaredField("mBoundApplication")
+        boundField.isAccessible = true
+        val bound = boundField.get(activityThread) ?: return
+        val nameField = bound.javaClass.getDeclaredField("processName")
+        nameField.isAccessible = true
+        nameField.set(bound, guestProcessName)
+        val readBack = atClass.getMethod("currentProcessName").invoke(null) as? String
+        Timber.tag(TAG).i("AppBindData.processName rewritten to $guestProcessName (readback: $readBack)")
+    }
+
     fun ensureGuestApplicationBooted(instanceId: String, packageName: String, apkPath: String) {
         // Skip if already booted
         if (applicationManager.getApplication(instanceId) != null) {
@@ -1267,6 +1288,12 @@ class VirtualEngine @Inject constructor(
                 Timber.tag(TAG).w(e, "spoofProcSelf failed for $packageName")
             }
 
+            // Capture the stub slot BEFORE any renaming below:
+            // VirtualCallerResolver parses the slot out of the process
+            // name to route PM calls; once the name becomes the guest's,
+            // the slot must come from this cache or PM isolation breaks.
+            VirtualCallerResolver.cacheProcessSlotFromCurrentName()
+
             // Take on the guest's process identity at the source:
             // rename this stub process (kernel comm via prctl, argv0)
             // to the guest's process name BEFORE its Application runs.
@@ -1287,6 +1314,19 @@ class VirtualEngine @Inject constructor(
                 nativeHookBridge.setProcessName(packageName)
             } catch (e: Exception) {
                 Timber.tag(TAG).w(e, "setProcessName failed for $packageName")
+            }
+
+            // Rewrite the framework's own record of this process's name:
+            // ActivityThread.currentProcessName() (and with it
+            // Application.getProcessName()) reads
+            // mBoundApplication.processName, which still says
+            // com.nextvm.app:pN after the kernel/argv renames above.
+            // The slot was cached above, so this cannot break the PM
+            // caller's slot resolution.
+            try {
+                rewriteBoundProcessName(packageName)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "rewriteBoundProcessName failed for $packageName")
             }
 
             // Boot the Application via ApplicationManager
