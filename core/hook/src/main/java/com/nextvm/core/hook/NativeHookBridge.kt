@@ -364,6 +364,20 @@ class NativeHookBridge @Inject constructor() {
     }
 
     /**
+     * Rename the current (stub) process to the guest's process name at
+     * the source (kernel comm via prctl). Complements the /proc content
+     * spoofing: identity fields read directly from the kernel — stat,
+     * status Name, task comms, other processes' views — become the
+     * guest's everywhere, not only on hooked read paths.
+     */
+    fun setProcessName(name: String) {
+        if (nativeHooksAvailable) {
+            nativeSetProcessName(name)
+        }
+        Timber.tag(TAG).d("Process renamed to guest: $name")
+    }
+
+    /**
      * Override a system property value.
      * Hooks __system_property_get to return our value.
      */
@@ -667,6 +681,8 @@ class NativeHookBridge @Inject constructor() {
 
     /** Set up /proc/self spoofing at native level. */
     private external fun nativeSpoofProcSelf(pid: Int, packageName: String)
+
+    private external fun nativeSetProcessName(name: String)
 
     /** Override a system property at native level. */
     private external fun nativeSpoofSystemProperty(key: String, value: String)

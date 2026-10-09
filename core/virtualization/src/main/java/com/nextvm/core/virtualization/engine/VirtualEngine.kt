@@ -1255,6 +1255,40 @@ class VirtualEngine @Inject constructor(
                 }
             }
 
+            // Arm native /proc/self spoofing (cmdline/maps/comm) for this
+            // guest BEFORE its Application runs. Packer shells read /proc
+            // inside attachBaseContext — i.e. during bindApplication below —
+            // and nativeSpoofProcSelf was previously never called at all,
+            // which left the native spoof state (package name) empty and
+            // every /proc spoof check inert.
+            try {
+                nativeHookBridge.spoofProcSelf(android.os.Process.myPid(), packageName)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "spoofProcSelf failed for $packageName")
+            }
+
+            // Take on the guest's process identity at the source:
+            // rename this stub process (kernel comm via prctl, argv0)
+            // to the guest's process name BEFORE its Application runs.
+            // The /proc spoofs above only fix what hooked readers see;
+            // the process name is also visible on channels no read hook
+            // can reach (framework process-name queries, the guest's
+            // own children inspecting their parent, ps/task views).
+            try {
+                // Process.setArgV0 is @hide — invoke reflectively (the
+                // runtime's hidden-API bypass makes it callable)
+                val setArgV0 = android.os.Process::class.java
+                    .getMethod("setArgV0", String::class.java)
+                setArgV0.invoke(null, packageName)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "setArgV0 failed for $packageName")
+            }
+            try {
+                nativeHookBridge.setProcessName(packageName)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "setProcessName failed for $packageName")
+            }
+
             // Boot the Application via ApplicationManager
             applicationManager.bindApplication(
                 instanceId = instanceId,

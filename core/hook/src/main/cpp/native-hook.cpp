@@ -26,9 +26,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <link.h>
 #include <elf.h>
+#include <dirent.h>
 
 // Define ELF_R_SYM if not provided by NDK headers
 #ifndef ELF_R_SYM
@@ -51,6 +53,22 @@
 #include <cerrno>
 #include <signal.h>
 #include <setjmp.h>
+#include <sys/syscall.h>
+#include <android/dlext.h>
+
+#ifndef SYS_memfd_create
+#  if defined(__aarch64__)
+#    define SYS_memfd_create 279
+#  elif defined(__arm__)
+#    define SYS_memfd_create 385
+#  elif defined(__x86_64__)
+#    define SYS_memfd_create 319
+#  endif
+#endif
+
+#ifndef MFD_CLOEXEC
+#  define MFD_CLOEXEC 0x0001U
+#endif
 
 #define LOG_TAG "NextVM-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -102,6 +120,17 @@ static orig_lstat_t real_lstat = nullptr;
 static orig_readlink_t real_readlink = nullptr;
 static orig_fopen_t real_fopen = nullptr;
 static orig_system_property_get_t real_system_property_get = nullptr;
+
+typedef void* (*orig_dlopen_t)(const char*, int);
+typedef void* (*orig_android_dlopen_ext_t)(const char*, int, const android_dlextinfo*);
+
+static orig_dlopen_t real_dlopen = nullptr;
+static orig_android_dlopen_ext_t real_android_dlopen_ext = nullptr;
+
+// Defined in the GOT/PLT section below: re-runs the patch pass so that
+// libraries loaded after nativeInit (e.g. a packer shell's .so brought in
+// via System.loadLibrary) receive the same GOT hooks as startup libraries.
+static void patch_newly_loaded_libraries();
 
 // ==================== Path Redirection Logic ====================
 
@@ -158,6 +187,364 @@ static bool is_proc_self_path(const char* path) {
 
 // ==================== Hook Implementations ====================
 
+// ==================== /proc/self Spoof Content ====================
+
+enum ProcSpoofKind {
+    PROC_SPOOF_NONE = 0,
+    PROC_SPOOF_CMDLINE,
+    PROC_SPOOF_MAPS,
+    PROC_SPOOF_COMM,
+    PROC_SPOOF_STATUS,
+    PROC_SPOOF_STAT
+};
+
+// Keywords that betray the virtual environment in /proc/self/maps.
+// Shared by the fopen() and open()/openat() spoof paths.
+static bool maps_line_visible(const char* line) {
+    static const char* kHiddenKeywords[] = {
+        "nextvm", "lsplant", "dobby", "bhook", "xhook", "substrate", "xposed"
+    };
+    for (const char* kw : kHiddenKeywords) {
+        if (strstr(line, kw) != nullptr) return false;
+    }
+    return true;
+}
+
+// Synthetic "normal install" locations used to rewrite the guest's own
+// mappings in /proc/self/maps. A stock device shows the guest APK under
+// /data/app/~~<rand>==/<pkg>-<rand>==/base.apk with its extracted libs in
+// the sibling lib/arm64 directory — mirror that shape (constant tokens
+// are fine; what matters is that the paths stop betraying the virtual
+// layout and stop containing the host's package name).
+static std::string synthetic_apk_path() {
+    return "/data/app/~~VmK8x2==/" + g_spoofed_package_name + "-VmK8x2==/base.apk";
+}
+
+static std::string synthetic_lib_path(const std::string& file_name) {
+    return "/data/app/~~VmK8x2==/" + g_spoofed_package_name +
+           "-VmK8x2==/lib/arm64/" + file_name;
+}
+
+/**
+ * Rewrite a filesystem path that betrays the virtual layout into its
+ * stock-install equivalent. Shared by the maps transform and by the
+ * readlink result rewriting (fd symlink targets). Returns false when
+ * the path needs no rewrite. When the path belongs to the host/engine
+ * itself (no guest-side equivalent exists), *host_fallback is set and
+ * `out` receives the synthetic APK path as a plausible stand-in —
+ * callers that present listings (maps) should drop such entries
+ * instead, callers that must return a path (readlink) use the stand-in.
+ */
+static bool rewrite_virtual_path(const std::string& path, std::string& out,
+                                 bool* host_fallback = nullptr) {
+    if (host_fallback != nullptr) *host_fallback = false;
+    std::string core = path;
+    std::string suffix;
+    if (core.size() >= 11 &&
+        core.compare(core.size() - 11, 11, " (deleted)") == 0) {
+        core.erase(core.size() - 11);
+        suffix = " (deleted)";
+    }
+
+    // Guest APK files: base + split APKs (virtual storage names splits
+    // "<instanceId>_split_config.<...>.apk"; stock form is the plain
+    // split file name next to base.apk).
+    if (core.find("/files/virtual/apks/") != std::string::npos &&
+        core.size() >= 4 && core.compare(core.size() - 4, 4, ".apk") == 0) {
+        std::string fname = core.substr(core.find_last_of('/') + 1);
+        size_t split_pos = fname.find("split_");
+        if (fname.find("_split_") != std::string::npos &&
+            split_pos != std::string::npos) {
+            out = "/data/app/~~VmK8x2==/" + g_spoofed_package_name +
+                  "-VmK8x2==/" + fname.substr(split_pos) + suffix;
+        } else {
+            out = synthetic_apk_path() + suffix;
+        }
+        return true;
+    }
+
+    // Guest data tree: extracted libs go to the synthetic lib dir,
+    // everything else mirrors under /data/data/<pkg>/.
+    const std::string data_marker = "/files/virtual/data/";
+    size_t data_pos = core.find(data_marker);
+    if (data_pos != std::string::npos) {
+        size_t inst_end = core.find('/', data_pos + data_marker.size());
+        if (inst_end != std::string::npos) {
+            std::string rest = core.substr(inst_end + 1);
+            if (rest.compare(0, 4, "lib/") == 0) {
+                out = synthetic_lib_path(
+                    rest.substr(rest.find_last_of('/') + 1)) + suffix;
+            } else {
+                out = "/data/data/" + g_spoofed_package_name + "/" + rest +
+                      suffix;
+            }
+            return true;
+        }
+    }
+
+    // Anything else naming the host app is the engine/host itself.
+    if (core.find("nextvm") != std::string::npos) {
+        if (host_fallback != nullptr) *host_fallback = true;
+        out = synthetic_apk_path() + suffix;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Transform one /proc/self/maps line for the spoofed view.
+ * Returns false if the line must be dropped; otherwise fills `out`.
+ *
+ * v1 of this spoof simply dropped every line mentioning the host —
+ * including the guest's OWN apk/lib mappings (they live under the
+ * host's data dir), so a shell locating itself or its APK in maps
+ * found nothing at all. v2 rewrites the guest's own paths to a
+ * plausible stock-install layout and only drops lines that belong to
+ * the host app / hook engine itself.
+ */
+static bool transform_maps_line(const char* line, std::string& out) {
+    const char* slash = strchr(line, '/');
+    if (slash != nullptr) {
+        std::string prefix(line, static_cast<size_t>(slash - line));
+        std::string core(slash);
+        while (!core.empty() && (core.back() == '\n' || core.back() == '\r')) {
+            core.pop_back();
+        }
+
+        std::string rewritten;
+        bool host_fallback = false;
+        if (rewrite_virtual_path(core, rewritten, &host_fallback)) {
+            // Host/engine mappings have no guest-side equivalent; a
+            // stock process simply has no such lines — drop them.
+            if (host_fallback) return false;
+            out = prefix + rewritten + "\n";
+            return true;
+        }
+    }
+
+    // Hook-framework keywords anywhere in the line (also covers
+    // [anon:...] mapping names) — drop.
+    if (!maps_line_visible(line)) return false;
+
+    out = line;
+    return true;
+}
+
+static std::string build_spoofed_maps() {
+    std::string result;
+    int fd = real_open != nullptr ? real_open("/proc/self/maps", O_RDONLY) : -1;
+    if (fd < 0) return result;
+    FILE* in = fdopen(fd, "r");
+    if (in == nullptr) {
+        close(fd);
+        return result;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), in)) {
+        std::string out;
+        if (transform_maps_line(line, out)) result += out;
+    }
+    fclose(in);
+    return result;
+}
+
+/**
+ * Build the spoofed /proc/self/status: the real content with only the
+ * Name line replaced. In a guest process Name reads "m.nextvm.app:p0";
+ * replace it with the guest's comm (package truncated to 15 chars,
+ * consistent with the comm spoof). Uid and TracerPid are kept real so
+ * the content stays consistent with getuid() and with the actual
+ * (untraced) state — the Java layer's fabricated Uid is NOT reused.
+ */
+static std::string read_whole_file(const char* path) {
+    std::string content;
+    int fd = real_open != nullptr ? real_open(path, O_RDONLY) : -1;
+    if (fd < 0) return content;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, static_cast<size_t>(n));
+    }
+    close(fd);
+    return content;
+}
+
+static std::string build_spoofed_status(const char* src_path = nullptr) {
+    std::string content = read_whole_file(
+        src_path != nullptr ? src_path : "/proc/self/status");
+
+    size_t pos = std::string::npos;
+    if (content.compare(0, 6, "Name:\t") == 0) {
+        pos = 0;
+    } else {
+        size_t p = content.find("\nName:\t");
+        if (p != std::string::npos) pos = p + 1;
+    }
+    if (pos != std::string::npos) {
+        size_t line_end = content.find('\n', pos);
+        std::string name_line = "Name:\t" + g_spoofed_package_name.substr(0, 15);
+        if (line_end == std::string::npos) {
+            content = content.substr(0, pos) + name_line + "\n";
+        } else {
+            content = content.substr(0, pos) + name_line + content.substr(line_end);
+        }
+    }
+    return content;
+}
+
+/**
+ * Build the spoofed /proc/<pid>/stat (also serves task/<main-tid>/stat):
+ * the real content with the parenthesised comm field replaced by the
+ * guest's comm. Every other field (pid, timings, sizes) stays real.
+ */
+static std::string build_spoofed_stat(const char* src_path = nullptr) {
+    std::string content = read_whole_file(
+        src_path != nullptr ? src_path : "/proc/self/stat");
+    size_t open = content.find('(');
+    size_t close = content.rfind(')');
+    if (open != std::string::npos && close != std::string::npos && close > open) {
+        content = content.substr(0, open + 1) +
+                  g_spoofed_package_name.substr(0, 15) +
+                  content.substr(close);
+    }
+    return content;
+}
+
+/**
+ * Classify a path as a spoofable /proc file (cmdline/maps/comm) for this
+ * process — matches both /proc/self/<file> and /proc/<own-pid>/<file>.
+ * Returns PROC_SPOOF_NONE when no spoofing applies (including when the
+ * Java side never armed spoofing via nativeSpoofProcSelf).
+ */
+static ProcSpoofKind match_proc_spoof(const char* path) {
+    if (path == nullptr || g_spoofed_package_name.empty()) return PROC_SPOOF_NONE;
+
+    const char* base = nullptr;
+    long owner_pid = -1;  // pid the requested file describes
+    if (strncmp(path, "/proc/self/", 11) == 0) {
+        base = path + 11;
+        owner_pid = static_cast<long>(getpid());
+    } else if (strncmp(path, "/proc/", 6) == 0) {
+        char* end = nullptr;
+        long pid = strtol(path + 6, &end, 10);
+        if (end != nullptr && *end == '/') {
+            // Own pid — or the armed guest process's pid, which is what
+            // a forked child of the guest reads when it inspects its
+            // parent (dual-process checks). The stub's own parent (the
+            // zygote) deliberately does NOT match in the armed process
+            // itself, because there owner references use getpid().
+            if (pid == static_cast<long>(getpid()) ||
+                pid == static_cast<long>(g_spoofed_pid)) {
+                base = end + 1;
+                owner_pid = pid;
+            }
+        }
+    }
+    if (base == nullptr) return PROC_SPOOF_NONE;
+
+    if (strcmp(base, "cmdline") == 0) return PROC_SPOOF_CMDLINE;
+    if (strcmp(base, "maps") == 0) return PROC_SPOOF_MAPS;
+    if (strcmp(base, "comm") == 0) return PROC_SPOOF_COMM;
+    if (strcmp(base, "status") == 0) return PROC_SPOOF_STATUS;
+    if (strcmp(base, "stat") == 0) return PROC_SPOOF_STAT;
+
+    // /proc/<pid>/task/<tid>/<file>: threads share the process cmdline,
+    // so that leaf spoofs for every tid. comm/status/stat only betray
+    // the guest for the MAIN thread (tid == pid), whose name is the
+    // stub's "m.nextvm.app:pN"; the other threads carry generic ART
+    // names identical to a stock app process and pass through real.
+    if (strncmp(base, "task/", 5) == 0) {
+        char* end = nullptr;
+        long tid = strtol(base + 5, &end, 10);
+        if (end != nullptr && *end == '/') {
+            const char* leaf = end + 1;
+            if (strcmp(leaf, "cmdline") == 0) return PROC_SPOOF_CMDLINE;
+            if (tid == owner_pid) {
+                if (strcmp(leaf, "comm") == 0) return PROC_SPOOF_COMM;
+                if (strcmp(leaf, "status") == 0) return PROC_SPOOF_STATUS;
+                if (strcmp(leaf, "stat") == 0) return PROC_SPOOF_STAT;
+            }
+        }
+    }
+    return PROC_SPOOF_NONE;
+}
+
+static bool write_all_fd(int fd, const char* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n <= 0) return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+/**
+ * Create an anonymous in-memory fd pre-filled with the spoofed content
+ * for the given /proc file, positioned at offset 0. Falls back to a
+ * tmpfile when memfd is unavailable. Returns -1 on failure.
+ */
+static int make_proc_spoof_fd(ProcSpoofKind kind, const char* src_path = nullptr) {
+    int fd = -1;
+#ifdef SYS_memfd_create
+    fd = static_cast<int>(syscall(SYS_memfd_create, "proc", MFD_CLOEXEC));
+#endif
+    FILE* tmp = nullptr;
+    if (fd < 0) {
+        tmp = tmpfile();
+        if (tmp == nullptr) return -1;
+        fd = fileno(tmp);
+    }
+
+    bool ok = true;
+    if (kind == PROC_SPOOF_CMDLINE) {
+        ok = write_all_fd(fd, g_spoofed_package_name.c_str(),
+                          g_spoofed_package_name.length() + 1);
+    } else if (kind == PROC_SPOOF_COMM) {
+        std::string comm = g_spoofed_package_name.substr(0, 15) + "\n";
+        ok = write_all_fd(fd, comm.c_str(), comm.length());
+    } else if (kind == PROC_SPOOF_MAPS) {
+        std::string content = build_spoofed_maps();
+        ok = !content.empty() && write_all_fd(fd, content.data(), content.size());
+    } else if (kind == PROC_SPOOF_STATUS) {
+        std::string content = build_spoofed_status(src_path);
+        ok = !content.empty() && write_all_fd(fd, content.data(), content.size());
+    } else if (kind == PROC_SPOOF_STAT) {
+        std::string content = build_spoofed_stat(src_path);
+        ok = !content.empty() && write_all_fd(fd, content.data(), content.size());
+    }
+
+    if (!ok) {
+        if (tmp != nullptr) fclose(tmp); else close(fd);
+        return -1;
+    }
+
+    lseek(fd, 0, SEEK_SET);
+    if (tmp != nullptr) {
+        // dup so the caller owns an fd independent of the tmpfile's FILE;
+        // the shared offset was just rewound to 0.
+        int out = dup(fd);
+        fclose(tmp);
+        fd = out;
+    }
+
+    if (fd >= 0) {
+        static int logged_cmdline = 0, logged_maps = 0, logged_comm = 0, logged_status = 0, logged_stat = 0;
+        int* counter = &logged_cmdline;
+        const char* name = "cmdline";
+        if (kind == PROC_SPOOF_MAPS) { counter = &logged_maps; name = "maps"; }
+        else if (kind == PROC_SPOOF_COMM) { counter = &logged_comm; name = "comm"; }
+        else if (kind == PROC_SPOOF_STATUS) { counter = &logged_status; name = "status"; }
+        else if (kind == PROC_SPOOF_STAT) { counter = &logged_stat; name = "stat"; }
+        if (*counter < 3) {
+            (*counter)++;
+            LOGI("open: served spoofed /proc/self/%s (pkg=%s)", name,
+                 g_spoofed_package_name.c_str());
+        }
+    }
+    return fd;
+}
+
 /**
  * Hooked open() — redirects file paths to sandbox, hides paths.
  */
@@ -166,6 +553,18 @@ static int hooked_open(const char* path, int flags, ...) {
     if (is_path_hidden(path)) {
         errno = ENOENT;
         return -1;
+    }
+
+    // Serve spoofed /proc/self files — packer shells read cmdline/maps
+    // via open() during their environment checks, long before any Java
+    // code runs. Only fopen() was spoofed previously, which native code
+    // rarely uses.
+    if ((flags & O_ACCMODE) == O_RDONLY) {
+        ProcSpoofKind kind = match_proc_spoof(path);
+        if (kind != PROC_SPOOF_NONE) {
+            int fd = make_proc_spoof_fd(kind, path);
+            if (fd >= 0) return fd;
+        }
     }
 
     std::string redirected = redirect_path(path);
@@ -192,6 +591,16 @@ static int hooked_openat(int dirfd, const char* path, int flags, ...) {
     if (is_path_hidden(path)) {
         errno = ENOENT;
         return -1;
+    }
+
+    // Serve spoofed /proc/self files for absolute paths (dirfd is
+    // ignored for absolute paths by the kernel anyway).
+    if (path != nullptr && path[0] == '/' && (flags & O_ACCMODE) == O_RDONLY) {
+        ProcSpoofKind kind = match_proc_spoof(path);
+        if (kind != PROC_SPOOF_NONE) {
+            int fd = make_proc_spoof_fd(kind, path);
+            if (fd >= 0) return fd;
+        }
     }
 
     std::string redirected = redirect_path(path);
@@ -279,7 +688,29 @@ static ssize_t hooked_readlink(const char* path, char* buf, size_t bufsiz) {
     std::string redirected = redirect_path(path);
     const char* actual_path = redirected.empty() ? path : redirected.c_str();
 
-    return real_readlink(actual_path, buf, bufsiz);
+    ssize_t n = real_readlink(actual_path, buf, bufsiz);
+    // When spoofing is armed, rewrite the RESULT if it names a virtual
+    // path. Directory enumerators learn the world from readlink targets
+    // (above all the /proc/*/fd symlink walk a packer shell performs),
+    // not from the paths passed in — fd targets must not leak the host
+    // layout, other guests' identities, or the word "virtual".
+    if (n > 0 && !g_spoofed_package_name.empty()) {
+        std::string target(buf, static_cast<size_t>(n));
+        std::string rewritten;
+        if (rewrite_virtual_path(target, rewritten)) {
+            size_t len = rewritten.length();
+            if (len > bufsiz) len = bufsiz;
+            memcpy(buf, rewritten.c_str(), len);
+            static int logged = 0;
+            if (logged < 5) {
+                logged++;
+                LOGI("readlink: rewrote target %s -> %s",
+                     target.c_str(), rewritten.c_str());
+            }
+            return static_cast<ssize_t>(len);
+        }
+    }
+    return n;
 }
 
 /**
@@ -289,6 +720,22 @@ static FILE* hooked_fopen(const char* path, const char* mode) {
     if (is_path_hidden(path)) {
         errno = ENOENT;
         return nullptr;
+    }
+
+    // Spoof /proc/<pid>/stat and /proc/<pid>/task/<tid>/{cmdline,comm,
+    // status,stat} through the shared matcher — the per-file branches
+    // below only cover the top-level /proc/self forms.
+    {
+        ProcSpoofKind kind = match_proc_spoof(path);
+        if (kind == PROC_SPOOF_STAT ||
+            (kind != PROC_SPOOF_NONE && strstr(path, "/task/") != nullptr)) {
+            int fd = make_proc_spoof_fd(kind, path);
+            if (fd >= 0) {
+                FILE* f = fdopen(fd, mode != nullptr ? mode : "r");
+                if (f != nullptr) return f;
+                close(fd);
+            }
+        }
     }
 
     // Spoof /proc/self/cmdline
@@ -303,30 +750,44 @@ static FILE* hooked_fopen(const char* path, const char* mode) {
         }
     }
 
-    // Spoof /proc/self/maps — filter out NEXTVM entries
-    if (is_proc_self_path(path) && strcmp(path, "/proc/self/maps") == 0) {
-        FILE* real_maps = real_fopen(path, mode);
-        if (real_maps) {
+    // Spoof /proc/self/comm
+    if (is_proc_self_path(path) && strcmp(path, "/proc/self/comm") == 0 &&
+        !g_spoofed_package_name.empty()) {
+        FILE* tmp = tmpfile();
+        if (tmp) {
+            std::string comm = g_spoofed_package_name.substr(0, 15) + "\n";
+            fwrite(comm.c_str(), 1, comm.length(), tmp);
+            fseek(tmp, 0, SEEK_SET);
+            return tmp;
+        }
+    }
+
+    // Spoof /proc/self/maps — guest paths rewritten to a stock-install
+    // layout, host/engine lines dropped (shared with the open() path)
+    if (is_proc_self_path(path) && strcmp(path, "/proc/self/maps") == 0 &&
+        !g_spoofed_package_name.empty()) {
+        std::string content = build_spoofed_maps();
+        if (!content.empty()) {
             FILE* tmp = tmpfile();
             if (tmp) {
-                char line[1024];
-                while (fgets(line, sizeof(line), real_maps)) {
-                    // Hide entries containing our library names
-                    if (strstr(line, "nextvm") == nullptr &&
-                        strstr(line, "lsplant") == nullptr &&
-                        strstr(line, "dobby") == nullptr &&
-                        strstr(line, "bhook") == nullptr &&
-                        strstr(line, "xhook") == nullptr &&
-                        strstr(line, "substrate") == nullptr &&
-                        strstr(line, "xposed") == nullptr) {
-                        fputs(line, tmp);
-                    }
-                }
-                fclose(real_maps);
+                fwrite(content.data(), 1, content.size(), tmp);
                 fseek(tmp, 0, SEEK_SET);
                 return tmp;
             }
-            fclose(real_maps);
+        }
+    }
+
+    // Spoof /proc/self/status — real content, Name line replaced
+    if (is_proc_self_path(path) && strcmp(path, "/proc/self/status") == 0 &&
+        !g_spoofed_package_name.empty()) {
+        std::string content = build_spoofed_status();
+        if (!content.empty()) {
+            FILE* tmp = tmpfile();
+            if (tmp) {
+                fwrite(content.data(), 1, content.size(), tmp);
+                fseek(tmp, 0, SEEK_SET);
+                return tmp;
+            }
         }
     }
 
@@ -361,6 +822,172 @@ static int hooked_system_property_get(const char* name, char* value) {
 
     // No spoof — call real implementation
     return real_system_property_get(name, value);
+}
+
+/**
+ * Hooked dlopen() — after a successful load, patch the GOTs of any
+ * libraries that just arrived. Packer shells (e.g. SecNeo's
+ * libDexHelper.so) are dlopen'd by the guest Application long after
+ * nativeInit's one-shot patch pass; without this, none of the hooks —
+ * including the /proc/self spoofing — apply to the shell's own calls.
+ */
+static void* hooked_dlopen(const char* filename, int flags) {
+    void* handle = real_dlopen != nullptr ? real_dlopen(filename, flags) : nullptr;
+    if (handle != nullptr) {
+        patch_newly_loaded_libraries();
+    }
+    return handle;
+}
+
+/**
+ * Hooked android_dlopen_ext() — same late-patch behavior as dlopen.
+ * This is the entry point the native loader itself uses for
+ * namespaced library loads (System.loadLibrary).
+ */
+static void* hooked_android_dlopen_ext(const char* filename, int flags,
+                                       const android_dlextinfo* extinfo) {
+    void* handle = real_android_dlopen_ext != nullptr
+        ? real_android_dlopen_ext(filename, flags, extinfo) : nullptr;
+    if (handle != nullptr) {
+        patch_newly_loaded_libraries();
+    }
+    return handle;
+}
+
+// ==================== Diagnostic hooks (log-only) ====================
+//
+// Identify which environment channel a packer shell actually uses
+// before dying: dl_iterate_phdr (library enumeration that bypasses all
+// /proc spoofing), ptrace + fork (dual-process anti-debug dance),
+// syscall (raw syscalls that bypass the PLT hooks on open/openat), and
+// opendir (directory enumeration; its libc-internal openat also
+// bypasses our PLT hooks). These hooks NEVER alter behaviour: they log
+// (rate limited, caller attributed via dladdr) and forward to the real
+// implementation.
+
+typedef int (*orig_dl_iterate_phdr_t)(int (*)(struct dl_phdr_info*, size_t, void*), void*);
+typedef long (*orig_ptrace_t)(int, ...);
+typedef long (*orig_syscall_t)(long, ...);
+typedef pid_t (*orig_fork_t)();
+typedef DIR* (*orig_opendir_t)(const char*);
+
+static orig_dl_iterate_phdr_t real_dl_iterate_phdr = nullptr;
+static orig_ptrace_t real_ptrace = nullptr;
+static orig_syscall_t real_syscall = nullptr;
+static orig_fork_t real_fork = nullptr;
+static orig_opendir_t real_opendir = nullptr;
+
+static void diag_caller(void* ret_addr, char* buf, size_t len) {
+    Dl_info info;
+    if (ret_addr != nullptr && dladdr(ret_addr, &info) && info.dli_fname != nullptr) {
+        const char* base = strrchr(info.dli_fname, '/');
+        snprintf(buf, len, "%s", base != nullptr ? base + 1 : info.dli_fname);
+    } else {
+        snprintf(buf, len, "?");
+    }
+}
+
+static int hooked_dl_iterate_phdr(int (*callback)(struct dl_phdr_info*, size_t, void*),
+                                  void* data) {
+    static int logged = 0;
+    if (logged < 10) {
+        logged++;
+        char who[128], cb_who[128];
+        diag_caller(__builtin_return_address(0), who, sizeof(who));
+        diag_caller((void*)callback, cb_who, sizeof(cb_who));
+        LOGI("DIAG dl_iterate_phdr called by %s (callback in %s)", who, cb_who);
+    }
+    if (real_dl_iterate_phdr) return real_dl_iterate_phdr(callback, data);
+    return -1;
+}
+
+static long hooked_ptrace(int request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    pid_t pid = va_arg(ap, pid_t);
+    void* addr = va_arg(ap, void*);
+    void* data = va_arg(ap, void*);
+    va_end(ap);
+    static int logged = 0;
+    if (logged < 30) {
+        logged++;
+        char who[128];
+        diag_caller(__builtin_return_address(0), who, sizeof(who));
+        LOGI("DIAG ptrace req=%d pid=%d addr=%p data=%p by %s",
+             request, (int)pid, addr, data, who);
+    }
+    if (real_ptrace) return real_ptrace(request, pid, addr, data);
+    errno = ENOSYS;
+    return -1;
+}
+
+static long hooked_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a1 = va_arg(ap, long);
+    long a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long);
+    long a5 = va_arg(ap, long);
+    long a6 = va_arg(ap, long);
+    va_end(ap);
+
+    static __thread bool in_hook = false;
+    if (!in_hook) {
+        in_hook = true;
+        // aarch64 numbers of interest: faccessat=48, openat=56, close=57,
+        // getdents64=61, read=63, pread64=67, readlinkat=78,
+        // newfstatat=79, ptrace=117, kill=129, tgkill=131, clone=220
+        bool interesting = number == 48 || number == 56 || number == 57 ||
+                           number == 61 || number == 63 || number == 67 ||
+                           number == 78 || number == 79 || number == 117 ||
+                           number == 129 || number == 131 || number == 220;
+        static int logged_int = 0, logged_other = 0;
+        if ((interesting && logged_int < 40) || (!interesting && logged_other < 10)) {
+            if (interesting) logged_int++; else logged_other++;
+            char who[128];
+            diag_caller(__builtin_return_address(0), who, sizeof(who));
+            if (number == 56 && a2 != 0) {
+                LOGI("DIAG syscall openat dirfd=%ld path=%s by %s",
+                     a1, (const char*)a2, who);
+            } else {
+                LOGI("DIAG syscall nr=%ld a1=%ld a2=%ld a3=%ld by %s",
+                     number, a1, a2, a3, who);
+            }
+        }
+        in_hook = false;
+    }
+    if (real_syscall) return real_syscall(number, a1, a2, a3, a4, a5, a6);
+    errno = ENOSYS;
+    return -1;
+}
+
+static pid_t hooked_fork() {
+    static int logged = 0;
+    bool log_it = logged < 10;
+    if (log_it) {
+        logged++;
+        char who[128];
+        diag_caller(__builtin_return_address(0), who, sizeof(who));
+        LOGI("DIAG fork called by %s (in pid %d)", who, (int)getpid());
+    }
+    pid_t r = real_fork ? real_fork() : -1;
+    if (log_it) LOGI("DIAG fork returned %d in pid %d", (int)r, (int)getpid());
+    return r;
+}
+
+static DIR* hooked_opendir(const char* path) {
+    if (path != nullptr && strstr(path, "/proc") != nullptr) {
+        static int logged = 0;
+        if (logged < 20) {
+            logged++;
+            char who[128];
+            diag_caller(__builtin_return_address(0), who, sizeof(who));
+            LOGI("DIAG opendir %s by %s", path, who);
+        }
+    }
+    if (real_opendir) return real_opendir(path);
+    return nullptr;
 }
 
 // ==================== GOT/PLT Hook Installation ====================
@@ -420,6 +1047,16 @@ static HookEntry g_hook_entries[] = {
     {"readlink",                (void*)hooked_readlink,             (void**)&real_readlink},
     {"fopen",                   (void*)hooked_fopen,                (void**)&real_fopen},
     {"__system_property_get",   (void*)hooked_system_property_get,  (void**)&real_system_property_get},
+    {"open64",                  (void*)hooked_open,                 (void**)&real_open},
+    {"openat64",                (void*)hooked_openat,               (void**)&real_openat},
+    {"fopen64",                 (void*)hooked_fopen,                (void**)&real_fopen},
+    {"dlopen",                  (void*)hooked_dlopen,               (void**)&real_dlopen},
+    {"android_dlopen_ext",      (void*)hooked_android_dlopen_ext,   (void**)&real_android_dlopen_ext},
+    {"dl_iterate_phdr",         (void*)hooked_dl_iterate_phdr,      (void**)&real_dl_iterate_phdr},
+    {"ptrace",                  (void*)hooked_ptrace,               (void**)&real_ptrace},
+    {"syscall",                 (void*)hooked_syscall,              (void**)&real_syscall},
+    {"fork",                    (void*)hooked_fork,                 (void**)&real_fork},
+    {"opendir",                 (void*)hooked_opendir,              (void**)&real_opendir},
 };
 static constexpr int g_hook_count = sizeof(g_hook_entries) / sizeof(g_hook_entries[0]);
 
@@ -515,24 +1152,31 @@ static void patch_library_got(uintptr_t base_addr, const char* lib_name,
     if (symtab == nullptr || strtab == nullptr) return;
     if (rel_plt == nullptr && rela_plt == nullptr) return;
 
-    // Validate symtab/strtab pointers — on some Android versions/libraries,
-    // d_ptr values are relative offsets from base_addr rather than absolute addresses.
-    // Addresses below 0x10000 are almost certainly relative offsets, not real pointers.
-    uintptr_t symtab_addr = reinterpret_cast<uintptr_t>(symtab);
-    uintptr_t strtab_addr = reinterpret_cast<uintptr_t>(strtab);
-
-    if (symtab_addr < 0x10000 || strtab_addr < 0x10000) {
-        if (base_addr > 0) {
-            // Try adjusting by adding base_addr
-            if (symtab_addr < 0x10000)
-                symtab = reinterpret_cast<const ElfW(Sym)*>(base_addr + symtab_addr);
-            if (strtab_addr < 0x10000)
-                strtab = reinterpret_cast<const char*>(base_addr + strtab_addr);
-        } else {
-            LOGW("Skipping %s: symtab/strtab appear to be relative offsets but base_addr=0", lib_name);
-            return;
-        }
+    // Normalize dynamic-segment pointers. On Android 17 many libraries keep
+    // link-time virtual addresses (offsets relative to the load bias) in their
+    // in-memory PT_DYNAMIC entries instead of relocated absolute addresses.
+    // Any d_ptr below base_addr is such an offset and must be rebased by the
+    // load bias; pointers at/above base_addr are already absolute and are left
+    // untouched. The previous code only rebased symtab/strtab when they were
+    // below 0x10000 — real offsets are routinely larger than that (e.g.
+    // strtab=0x23250), and rela_plt/rel_plt were never rebased at all — so
+    // essentially every library failed the readability probes below and was
+    // skipped (observed: 354 skipped, 0 hooked on Android 17 / SDK 37).
+    if (base_addr == 0) {
+        LOGW("Skipping %s: base_addr=0, cannot rebase dynamic pointers", lib_name);
+        return;
     }
+    auto rebase_ptr = [base_addr](uintptr_t p) -> uintptr_t {
+        return (p != 0 && p < base_addr) ? base_addr + p : p;
+    };
+    symtab = reinterpret_cast<const ElfW(Sym)*>(
+        rebase_ptr(reinterpret_cast<uintptr_t>(symtab)));
+    strtab = reinterpret_cast<const char*>(
+        rebase_ptr(reinterpret_cast<uintptr_t>(strtab)));
+    rel_plt = reinterpret_cast<const ElfW(Rel)*>(
+        rebase_ptr(reinterpret_cast<uintptr_t>(rel_plt)));
+    rela_plt = reinterpret_cast<const ElfW(Rela)*>(
+        rebase_ptr(reinterpret_cast<uintptr_t>(rela_plt)));
 
     // Verify symtab and strtab are actually readable memory
     if (!is_address_readable(symtab, sizeof(ElfW(Sym))) ||
@@ -617,12 +1261,21 @@ static void patch_library_got(uintptr_t base_addr, const char* lib_name,
     }
 }
 
+// Base addresses already processed by a patch pass. Libraries loaded
+// after nativeInit are patched by re-running the pass from the dlopen
+// hooks; this set keeps the pass idempotent and cheap.
+static std::unordered_set<uintptr_t> g_patched_bases;
+static std::mutex g_patch_mutex;
+
 /**
  * dl_iterate_phdr callback — called for each loaded shared object.
  * We find the PT_DYNAMIC segment and use it to locate GOT entries.
  */
 static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, void* /*data*/) {
     if (info->dlpi_name == nullptr) return 0;
+
+    // Already processed by an earlier pass — nothing to do.
+    if (info->dlpi_addr != 0 && g_patched_bases.count(info->dlpi_addr)) return 0;
 
     const char* name = info->dlpi_name;
 
@@ -655,6 +1308,8 @@ static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, vo
         patch_library_got(info->dlpi_addr, name, dynamic);
     }
 
+    if (info->dlpi_addr != 0) g_patched_bases.insert(info->dlpi_addr);
+
     return 0;
 }
 
@@ -682,6 +1337,22 @@ static bool install_plt_hooks() {
     if (!real_system_property_get)
         real_system_property_get = (orig_system_property_get_t)dlsym(
             RTLD_DEFAULT, "__system_property_get");
+    if (!real_dlopen)
+        real_dlopen = (orig_dlopen_t)dlsym(RTLD_DEFAULT, "dlopen");
+    if (!real_android_dlopen_ext)
+        real_android_dlopen_ext = (orig_android_dlopen_ext_t)dlsym(
+            RTLD_DEFAULT, "android_dlopen_ext");
+    if (!real_dl_iterate_phdr)
+        real_dl_iterate_phdr = (orig_dl_iterate_phdr_t)dlsym(
+            RTLD_DEFAULT, "dl_iterate_phdr");
+    if (!real_ptrace)
+        real_ptrace = (orig_ptrace_t)dlsym(RTLD_DEFAULT, "ptrace");
+    if (!real_syscall)
+        real_syscall = (orig_syscall_t)dlsym(RTLD_DEFAULT, "syscall");
+    if (!real_fork)
+        real_fork = (orig_fork_t)dlsym(RTLD_DEFAULT, "fork");
+    if (!real_opendir)
+        real_opendir = (orig_opendir_t)dlsym(RTLD_DEFAULT, "opendir");
 
     if (!real_open || !real_openat || !real_access || !real_stat) {
         LOGE("Failed to resolve one or more libc functions via dlsym");
@@ -689,10 +1360,39 @@ static bool install_plt_hooks() {
     }
 
     // Iterate all loaded libraries and patch GOT entries
-    dl_iterate_phdr(install_hooks_callback, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(g_patch_mutex);
+        dl_iterate_phdr(install_hooks_callback, nullptr);
+    }
 
     LOGI("PLT hooks installed successfully");
     return true;
+}
+
+/**
+ * Re-run the GOT patch pass so libraries loaded after nativeInit
+ * (via dlopen / android_dlopen_ext / Runtime.nativeLoad) receive the
+ * same hooks as startup libraries. Idempotent: libraries already
+ * processed are skipped via g_patched_bases.
+ */
+static void patch_newly_loaded_libraries() {
+    static thread_local bool in_pass = false;
+    if (in_pass || !g_initialized) return;
+    in_pass = true;
+
+    size_t added = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_patch_mutex);
+        size_t before = g_patched_bases.size();
+        dl_iterate_phdr(install_hooks_callback, nullptr);
+        added = g_patched_bases.size() - before;
+    }
+    if (added > 0) {
+        LOGI("Late-patch: GOT hooks applied to %zu newly loaded librar%s",
+             added, added == 1 ? "y" : "ies");
+    }
+
+    in_pass = false;
 }
 
 // ==================== JNI Bridge ====================
@@ -797,6 +1497,32 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeSpoofProcSelf(
         g_spoofed_package_name = std::string(pkg);
         LOGI("/proc/self spoof set: pid=%d, pkg=%s", pid, pkg);
         env->ReleaseStringUTFChars(packageName, pkg);
+    }
+}
+
+/**
+ * Rename the calling thread/process to the guest's process name:
+ * prctl(PR_SET_NAME) sets the kernel comm, which is what /proc/self/stat,
+ * /proc/self/status (Name), task/<tid>/comm and ps all report. Doing it
+ * at the source makes the identity right on channels no read-path hook
+ * can cover (e.g. the guest's forked children inspecting their parent,
+ * or anything reading /proc from outside the hooked libraries).
+ * MUST match Kotlin: nativeSetProcessName(name: String)
+ */
+JNIEXPORT void JNICALL
+Java_com_nextvm_core_hook_NativeHookBridge_nativeSetProcessName(
+    JNIEnv* env, jobject thiz, jstring name)
+{
+    (void)thiz;
+    const char* n = env->GetStringUTFChars(name, nullptr);
+    if (n) {
+        // Kernel comm holds at most 15 visible chars (TASK_COMM_LEN-1)
+        char comm[16];
+        strncpy(comm, n, sizeof(comm) - 1);
+        comm[sizeof(comm) - 1] = '\0';
+        prctl(PR_SET_NAME, comm, 0, 0, 0);
+        LOGI("process renamed: comm=%s", comm);
+        env->ReleaseStringUTFChars(name, n);
     }
 }
 
@@ -1007,7 +1733,14 @@ static jstring hooked_nativeLoad(JNIEnv* env, jclass runtimeClass,
 
     // Call original implementation
     if (g_orig_nativeLoad_fn != nullptr) {
-        return ((NativeLoadFn)g_orig_nativeLoad_fn)(env, runtimeClass, filename, classLoader, caller);
+        jstring result = ((NativeLoadFn)g_orig_nativeLoad_fn)(
+            env, runtimeClass, filename, classLoader, caller);
+        // The load may have brought new libraries into the process
+        // (e.g. a packer shell's libDexHelper.so via System.loadLibrary
+        // in the guest Application's attach). Patch their GOTs now —
+        // before any of their JNI methods get invoked.
+        patch_newly_loaded_libraries();
+        return result;
     }
 
     // If we somehow don't have the original, try dlsym as last resort
